@@ -1,4 +1,29 @@
-#!/usr/bin/env python2.7
+###############################################################################
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2016 Matthias Linden
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+############################################################################### 
+
 #coding:utf-8
 
 import json
@@ -6,6 +31,7 @@ import time
 import hashlib
 import hmac
 
+# Building upon twisted 
 from twisted.web.iweb import IBodyProducer
 from twisted.internet.defer import Deferred
 from twisted.web.client import Agent,readBody,WebClientContextFactory
@@ -14,8 +40,27 @@ from twisted.internet import reactor
 from twisted.internet.protocol import Protocol
 
 
-class bitcoinDeAPI(object):
+class bitcoinDeAPIpendingTransaction(object):
+	def __init__(self):
+		pass
 	
+class bitcoinDeAPIpending(object):
+	def __init__(self):
+		# Handle enqueued request
+		self.requestID = 0
+		self.pending = {}
+	
+	def EnqueueTransaction(self,*args):
+		self.requestID += 1
+		rID = self.requestID
+		
+		return rID
+	
+	def DequeueTransaction(self,rID):
+		pass
+	
+
+class BitcoinDeAPI(object):
 	def __init__(self,reactor,api_key,api_secret):
 		# Bitcoin.de API URI
 		apihost = 'https://api.bitcoin.de'
@@ -34,7 +79,7 @@ class bitcoinDeAPI(object):
 		self.api_secret = api_secret
 		
 		self.calls = {}
-		# Method,uri,required params with allowed values,field to return (after credits/pages are stripped)
+		# Method,uri,required params with allowed values,credits,field to return (after credits/pages are stripped)
 		# Orders
 		self.calls['showOrderbook'] = ['GET',orderuri,{'type':['sell','buy']},2,'']
 		self.calls['showOrderbookCompact'] = ['GET',orderuri+'/compact',{},3,'']
@@ -44,7 +89,7 @@ class bitcoinDeAPI(object):
 		self.calls['showMyOrderDetails'] = ['GET',orderuri,{'order_id':[]},2,'']
 		# Trades
 		self.calls['executeTrade'] = ['POST',tradeuri,{'order_id':[],'amount':[]},1,'']
-		self.calls['showMyTradeDetails'] = ['POST',tradeuri,{'order_id':[]},3,'']
+		self.calls['showMyTradeDetails'] = ['GET',tradeuri,{'trade_id':[]},3,'']
 		self.calls['showMyTrades'] = ['GET',tradeuri,{},3,'']
 		self.calls['showPublicTradeHistory'] = ['GET',tradeuri+'/history',{'since_tid':[]},3,'']
 		# Account
@@ -52,6 +97,7 @@ class bitcoinDeAPI(object):
 		self.calls['showAccountLedger'] = ['GET',accounturi+'/ledger',{},3,'trades']
 		# Other
 		self.calls['showRates'] = ['GET',apihost+'/'+apiversion+'/rates',{},3,'']
+		
 	
 	def APIRequest(self,call,**kwargs):
 		"""Compiles the Request"""
@@ -69,20 +115,24 @@ class bitcoinDeAPI(object):
 				uri += '/'+kwargs["order_id"]
 				if method == 'GET':
 					kwargs = {}
-				else:
-					pass	# executeTrade,showMyTradeDetails requires order_id + params 
-			return self.EnqueRequest(method,kwargs,uri,data)
+			if 'trade_id' in required.keys():
+				uri += '/'+kwargs["trade_id"]
+				if method == 'GET':
+					kwargs = {}
+			return self.EnqueAPIRequest(method,kwargs,uri,credits,data)
 		else:
+			# Unknown request
 			d = Deferred()
-			d.callback(None)
+			d.errback(["Unknown request"])
 			return d
-
-	def EnqueRequest(self,method,params,uri,data):
-		# TODO: remove data from APIconnect Chain and into queue
+	
+	def EnqueAPIRequest(self,method,params,uri,credits,data):
 		return self.APIConnect(method,params,uri)
-
-	def APIConnect(self,method,params,uri):
-		"""Encapsulates all the API encoding"""
+		
+	def APIConnect(self,method,params,uri,eid=None):
+		"""Encapsulates all the API encoding, starts the HTTP request, returns deferred
+			eid is used to pass Data along the chain to be used later
+		"""
 		encoded_string = ''
 		if params:
 			for key, value in sorted(params.iteritems()):
@@ -111,41 +161,53 @@ class bitcoinDeAPI(object):
 		
 		bodyProducer = None
 		if method == 'POST':
-			bodyProducer = StringProducer(encoded_string)
-		return self.agent.request("GET",url,headers=h,bodyProducer=bodyProducer).addCallback(self.APIResponse)
+			bodyProducer = StringProducer(u''+encoded_string)
+			
+		d = self.agent.request("GET",url,headers=h,bodyProducer=bodyProducer)
+		d.addCallback(self.APIResponse,eid=eid)
+		return d
 	
-	def APIResponse(self,response):
-		finished = Deferred()
-		print response.code,response.phrase
+	def APIResponse(self,response,eid):
 		if response.code == 200:
-			response.deliverBody(BtcdeProtocol(finished))
-			finished.addCallback(self.DequeueRequest)
-		elif response.code == 201:
-			print "Request successfull"
-			finished.callback([response.code])
-		return finished
-		
-	def DequeueRequest(self,response):
-		finished = Deferred()
-		print response["credits"],response["errors"],response["page"]
-		del response["credits"]
-		del response["errors"]
-		if len(response.keys()) == 1:
-			finished.callback(response[response.keys()[0]])
+			finished = Deferred()
+			response.deliverBody(BtcdeAPIProtocol(finished))
+			finished.addCallback(self.DequeueAPIRequest,eid=eid)
+			return finished
 		else:
-			finished.callback(response)
-		return finished
+			return {"code":response.code,"phrase":response.phrase}
+		
+	def DequeueAPIRequest(self,response,eid):
+		return response
 
-class BtcdeProtocol(Protocol):
+class StringProducer(IBodyProducer):
+	def __init__(self, body):
+		self.body = body
+		self.length = len(body)
+
+	def startProducing(self, consumer):
+		consumer.write(self.body)
+		return succeed(None)
+
+	def pauseProducing(self):
+		pass
+
+	def stopProducing(self):
+		pass
+
+class BtcdeAPIProtocol(Protocol):
+	"""Processes the frames data, which might arrive in multiple packets, returns data when connection is finished"""
 	def __init__(self,deferred):
 		self.deferred = deferred
 		self.partial = ""
-		print "BTCdeProtocol"
 	
 	def dataReceived(self,data):
 		self.partial += data
 		
 	def connectionLost(self,reason):
-	#	print "ConnectionLost",reason
-		self.deferred.callback(json.loads(self.partial))
+		try:
+			self.deferred.callback(json.loads(self.partial))
+		except e:
+			print "JSON error"
+			self.deferred.errback(["JSON data couldn't be loaded properly",self.partial[-20:]])
+	
 	
