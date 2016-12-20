@@ -35,12 +35,11 @@ import hmac
 # Building upon twisted 
 from twisted.web.iweb import IBodyProducer
 from twisted.internet.defer import Deferred
-from twisted.web.client import Agent,readBody,WebClientContextFactory
+from twisted.web.client import Agent,readBody,WebClientContextFactory,HTTPConnectionPool
 from twisted.web.http_headers import Headers
 from twisted.internet import reactor
 from twisted.internet.protocol import Protocol
-
-
+	
 
 class BitcoinDeAPI(object):
 	def __init__(self,reactor,api_key,api_secret):
@@ -183,29 +182,33 @@ class BitcoinDeAPI(object):
 			header["errmessage"] = errors.get("message","")
 			header["errcode"] = errors.get("code",-1)
 			return header
-	
 
 class QueuedAPIRequest(object):
-	def __init__(self,eid,rhash,method,uri,params,credits,data,deferred):
+	"""Queued API Request to be stored till it's processed"""
+	def __init__(self,eid,rhash,method,uri,params,credits,deferred):
 		self.eid = eid
 		self.rhash = rhash
 		self.method=method
 		self.uri=uri
 		self.params=params
 		self.credits = credits
+		# List of deferreds which are waiting for the result --> DeliverResult
 		self.deferreds = [deferred]
+		self.done = 0
+		self.attempts = 0
+		
+	def Send(self):
+		self.attempts += 1
 		
 	def AddDeferred(self,deferred):
 		self.deferreds.append(deferred)
 		
 	def DeliverResult(self,result):
+	
+	#	result["attempts"] = self.attempts
 		for d in self.deferreds:
 			d.callback(result)
-	
-	def __del__(self):
-		for d in self.deferreds:
-			d.errback("no result during lifetime")
-		
+		self.done = 1
 	
 class QueuedBitcoinDeAPI(BitcoinDeAPI):
 	"""Implements a Queue that holds requests and manages credits"""
@@ -215,6 +218,14 @@ class QueuedBitcoinDeAPI(BitcoinDeAPI):
 		self.requestID = 0
 		self.queue = {}
 		self.pending = {}
+		# Store the Reshedule Handle
+		self.retrycall = self.reactor.callLater(.1,self.IssueNext)	# Dummy call, delayed start at .1
+		
+		# Credits
+		self.wait_for_credits = 0
+		self.lasttime = time.time()
+		self.lastcredits = 20
+		self.retryperiode = 3
 	
 	def CalcHash(self,method,uri,params):
 		h = 0
@@ -223,86 +234,159 @@ class QueuedBitcoinDeAPI(BitcoinDeAPI):
 		return hash(method)+hash(uri)+h
 		
 	def SameHashInQueue(self,h):
+		"""Return an already queued Request if it has similar hash to the requested one """
+		rk,rreq = -1,None
 		for k,req in self.queue.items():
 			if req.rhash == h:
-				return k,req
-		return 0,None
+				rk,rreq = k,req
+				break
+		return rk,rreq
 		
-	def StartRequests(self):
-		for k,req in self.queue.items():
-			if k not in self.pending.keys():
-				if self.CreditsAvailable(req.credits):
-					self.APIConnect(req.method,req.params,req.uri,k)#.chainDeferred(req.deferred)
-					self.pending[k] = req.credits
+	def IssueNext(self):
+	#	print "IssueNext",len(self.queue),len(self.pending)
+		self.wait_for_credits = 0
+		dt = 0.1	# Explicit pause inbetween two back to back request to avoid bad nonces
+		if self.CreditsAvailable(3):
+			for k,req in self.queue.items():
+				if k not in self.pending.keys():
+					if req.attempts < 10:
+						self.APIConnect(req.method,req.params,req.uri,k) # Chaining of APIResponse is done in this function, so returned deferred is not used.
+						self.pending[k] = req.credits
+						req.Send()
+					else:
+						req.DeliverResult({"error":"too many unsuccesful attempts","attempts":req.attempts})
+						self.DeleteRequest(k)
+					break
+		else:
+			dt = 2
+		if len(self.queue) > len(self.pending):
+			# Schedule Next Issue, either back to back or when enough credits should be available
+			self.ScheduleNextIssue(dt)
+		
+	def ScheduleNextIssue(self,dt=None):
+		"""Is called from IssueNext, APIRequest and whenever Timing has to be updated (due to tight credits) """
+	#	print "ScheduleNextIssue",dt,self.retrycall.active()
+		if dt== None:
+			dt = 0.0
+		if self.wait_for_credits == 0:
+			if dt > 2:
+				print "Wait for crecits",dt
+				self.wait_for_credits = 1
+			if self.retrycall.active():
+				self.retrycall.reset(dt)
+			else:
+				self.retrycall = self.reactor.callLater(dt,self.IssueNext)
+		else:
+			pass	# Don't scheule if waiting for credits (code 429, retry in)
+		
+	def Reenqueue(self,eid):
+		if eid in self.pending.keys():
+			del self.pending[eid]
+		self.ScheduleNextIssue()
+					
+	def DeleteRequest(self,eid):
+		del self.queue[eid]
 	
 	def CreditsAvailable(self,credits):
-		print "inflight:",sum(self.pending.values())
-		return True
+		ct = time.time()
+		dt = ct-self.lasttime
+		available = min(20,self.lastcredits+dt)-sum(self.pending.values())
+	#	print "inflight:",sum(self.pending.values()),"credits",available
+		if available > 2+credits:
+			return True
+		else:
+			return False
 	
-	def EnqueAPIRequest(self,method,params,uri,credits,data):
+	def EnqueAPIRequest(self,method,params,uri,credits,timeout=20):
 		finished = Deferred()
 		
 		h = self.CalcHash(method,uri,params)
-		
 		samereqID,samereq = self.SameHashInQueue(h)	# Return same request if already enqueued or pending
-		if samereqID == 0:	# unique request
+		if samereqID == -1:	# unique request
 			eid = self.requestID
 			self.requestID += 1
-			request = QueuedAPIRequest(eid,h,method,uri,params,credits,data,finished)
+			request = QueuedAPIRequest(eid,h,method,uri,params,credits,finished)	# Create the Request-object
 			self.queue[eid] = request
-		else:
-			samereq.AddDeferred(finished)	# deferred to same request's chain
+			
+		else:	# Request is already running
+			eid = samereqID
+			samereq.AddDeferred(finished)	# Add deferred to list of data-recipients
 		
-		self.StartRequests()
+		self.ScheduleNextIssue()
 		return finished
-	
+		
 	def APIResponse(self,response,eid):
-		"""Handle the returned HTTP-Header"""
+		"""Process Response.header and choose treatment of the body"""
 		finished = Deferred()
-		if response.code == 200:	# Request OK, read body
-			response.deliverBody(BtcdeAPIProtocol(finished))
-			finished.addCallback(self.DequeueAPIRequest,eid=eid)
-		elif response.code == 201:	# Request successfull
-			finished.callback([response.code])
-		elif response.code == 400:	# Bad Request
-			finished.errback([response.code,response.phrase])
-		elif response.code == 429:	# Too many requests, no credits available
-			pass
-		elif response.code == 403:	# Forbidden, temporarily banned
-			pass
-		elif response.code == 404:	# Entity not found
-			pass
-		elif response.code == 422:	# Not processed successfully
-			pass
+		response.deliverBody(BtcdeAPIProtocol(finished))
+		req = self.queue[eid]
+		header = {"code":response.code,"phrase":response.phrase,"call":req.method+":"+req.uri,"reqID":eid}
+		if response.code == 200 or response.code == 201:
+			finished.addCallback(self.DequeueAPIRequest,eid=eid,header=header)
+		elif response.code == 429 or response.code == 403:
+			retry = int(response.headers.getRawHeaders("Retry-After")[0])
+			header["retry"] = retry
+			self.Reenqueue(eid)
+			self.ScheduleNextIssue(retry+3)
+			finished.addCallback(self.DequeueAPIErrors,eid=eid,header=header)
 		else:
-			print "unhandled Response",response.code,response.phrase
-			finished.errback(["Unhandled response code",response.code,response.phrase])
+			d = finished.addCallback(self.DequeueAPIErrors,eid=eid,header=header)
+			if response.code == 400:
+				self.Reenqueue(eid)
+				self.ScheduleNextIssue()
+			else:
+				# Every other error than 400 is not retried!
+				d.addCallback(req.DeliverResult)
 		return finished
-	
-	def DequeueAPIRequest(self,response,eid):
-		"""Handle credits, errors, pages after Protocol has received all data"""
-	#	finished = Deferred()
-	#	print eid,response["credits"],response["errors"]#,response["page"]
-#		print self.pending[eid]
-	#	del response["credits"]
-	#	del response["errors"]
-	#	if len(response.keys()) == 1:
-	#		finished.callback(response[response.keys()[0]])
-	#	else:
-	#		finished.callback(response)
-		self.queue	[eid].DeliverResult(response)
-	#	for d in self.requests[eid].deferreds:
-	#		d.callback(response)
-	#	return finished
-	
+		
+	def DequeueAPIRequest(self,response,eid,header):
+		"""Handle (actual) credits,errors after Protocol has received all data"""
+		req = self.queue[eid]
+		response.update(header)
+		response["attempts"] = req.attempts
+		
+		credits = response.get("credits",0)
+		self.lasttime = time.time()
+		self.lastcredits = credits
+		
+		self.queue[eid].DeliverResult(response)
+		del self.queue[eid]
+		del self.pending[eid]
+		
+		return response
+		
+	def DequeueAPIErrors(self,response,eid,header):
+		"""Pick error info (message,code) from Response.body and return it along with the header (code,phrase,[retry])"""
+		try:
+			errors = response.get("errors",[{}])[0]
+		except:
+			header["message"] = "Unknown error"
+			return header
+		else:
+			header["errmessage"] = errors.get("message","")
+			header["errcode"] = errors.get("code",-1)
+			return header
+		
 	def APIRequestPages(self,call,pages,**kwargs):
 		"""Request a certain number of pages
 			- As Requests might take some time due to limited credits, pages are requested in blocks 
 		"""
 		pass
 	
-
+	def TooManyRequests(self,code):
+		self.lasttime = time.time()
+		if code == 429:
+			self.lastcredits = 0
+			self.retryperiode = 25
+		elif code == 403:
+			self.lastcredits = -20
+			self.retryperiode = 120
+		else:
+			self.lastcredits = 0
+		
+	
 class StringProducer(IBodyProducer):
+	"""Produces POST request bodies"""
 	def __init__(self, body):
 		self.body = body
 		self.length = len(body)
@@ -328,8 +412,9 @@ class BtcdeAPIProtocol(Protocol):
 		
 	def connectionLost(self,reason):
 		try:
-			self.deferred.callback(json.loads(self.partial))
-		except e:
-			print "JSON error"
+			data = json.loads(self.partial)
+		except:
+			print "JSON error",self.partial
 			self.deferred.errback(["JSON data couldn't be loaded properly",self.partial[-20:]])
-	
+		else:
+			self.deferred.callback(data)
