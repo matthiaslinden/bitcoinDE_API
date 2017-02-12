@@ -28,12 +28,13 @@
 #coding:utf-8
 
 import time
-import sys
-import hashlib
-import json
+#import sys
+from hashlib import sha1
+from json import loads
 
-import os,base64	# Websocket Key handling
-import struct		# Websocket Length handling
+from os import urandom
+from base64 import b64encode	# Websocket Key handling
+from struct import unpack	# Websocket Length handling
 
 from twisted.python import log
 
@@ -50,6 +51,7 @@ class ClientIo0916Protocol(basic.LineReceiver):
 		self.state = 0
 		self.http_pos = ""
 		self.http_length = 0
+		self.pingcount = 0
 		
 		self.setLineMode()
 		print "connectionMade"
@@ -64,7 +66,7 @@ class ClientIo0916Protocol(basic.LineReceiver):
 		nonce,t1,t2,options = line.split(":")
 		if "websocket" in options:
 			if len(nonce) == 20:
-				self.websocket_key = base64.b64encode(os.urandom(16))
+				self.websocket_key = b64encode(urandom(16))
 				data = "GET /socket.io/1/websocket/%s HTTP/1.1\r\n"%nonce
 			#	data += "Accept-Encoding: gzip, deflate, sdch"
 				data += "Connection: Upgrade\r\nUpgrade: websocket\r\n"
@@ -102,14 +104,15 @@ class ClientIo0916Protocol(basic.LineReceiver):
 			l,b = ord(data[1])&(0b1111111),2	# Handle the length field
 			if l == 126:
 				b = 4
-				l = struct.unpack('!H',data[2:4])[0]
+				l = unpack('!H',data[2:4])[0]	# struct.unpack
 			elif l == 127:
 				b = 10
-				l = struct.unpack('!Q',data[2:10])[0]
+				l = unpack('!Q',data[2:10])[0]
 			if data[b] == "1":
 				pass
 			elif data[b] == "2":
-				print "ping"
+				self.pingcount += 1
+				#print "ping"
 			elif data[b] == "5":
 				self.onPacketReceived(data[b:],l-b)
 			else:
@@ -132,9 +135,9 @@ class ClientIo0916Protocol(basic.LineReceiver):
 		elif self.state == 1:
 			if "Sec-WebSocket-Accept:" in line:
 				key_got = line.split(" ")[1]
-				sha1 = hashlib.sha1()
-				sha1.update(self.websocket_key + self._MAGIC)
-				key_accept = base64.b64encode(sha1.digest())
+				mysha1 = sha1()
+				mysha1.update(self.websocket_key + self._MAGIC)
+				key_accept = b64encode(mysha1.digest())
 				if key_got == key_accept:
 					self.state = 2
 				else:
@@ -164,7 +167,7 @@ class WSjsonBitcoinDEProtocol(ClientIo0916Protocol):
 		i = 1
 		while data[i] == ":":
 			i+=1
-		jdata = json.loads(data[i:])
+		jdata = loads(data[i:])	# json.loads
 		otype,args = jdata["name"],jdata["args"][0]
 		self.onEvent(otype,args)
 		

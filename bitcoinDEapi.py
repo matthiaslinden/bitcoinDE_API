@@ -27,10 +27,10 @@
 #!/usr/bin/env python2.7
 #coding:utf-8
 
-import json
+from json import loads
 import time
-import hashlib
-import hmac
+from hashlib import md5,sha256
+from hmac import new as hmac_new
 
 # Building upon twisted 
 from twisted.web.iweb import IBodyProducer
@@ -54,7 +54,7 @@ class BitcoinDeAPI(object):
 		
 		self.reactor = reactor
 		pool = HTTPConnectionPool(reactor)		# Actually reusing the connection leads to correct credits
-		pool.maxPersistentPerHost = 2
+		pool.maxPersistentPerHost = 1
 		self.contextFactory = WebClientContextFactory()
 		self.agent = Agent(self.reactor, self.contextFactory,pool=pool)
 		
@@ -130,12 +130,12 @@ class BitcoinDeAPI(object):
 		self.nonce += 1
 		
 		if method == 'POST':
-			md5_encoded_query_string = hashlib.md5(encoded_string).hexdigest()
+			md5_encoded_query_string = md5(encoded_string).hexdigest()
 		else:
-			md5_encoded_query_string = hashlib.md5('').hexdigest()
+			md5_encoded_query_string = md5('').hexdigest()
 		
 		hmac_data = method + '#' + url + '#' + self.api_key + '#' + str(self.nonce) + '#' + md5_encoded_query_string
-		hmac_signed = hmac.new(self.api_secret,digestmod=hashlib.sha256, msg=hmac_data).hexdigest()
+		hmac_signed = hmac_new(self.api_secret,digestmod=sha256, msg=hmac_data).hexdigest()
 			
 		header = {'content-type':['application/x-www-form-urlencoded;charset=utf-8']}
 		header[b"X-API-KEY"] = [self.api_key]
@@ -250,8 +250,7 @@ class QueuedAPIRequest(object):
 		self.deferreds.append(deferred)
 		
 	def DeliverResult(self,result):
-	
-	#	result["attempts"] = self.attempts
+		result["attempts"] = self.attempts
 		for d in self.deferreds:
 			d.callback(result)
 		self.done = 1
@@ -460,7 +459,7 @@ class BtcdeAPIProtocol(Protocol):
 		
 	def connectionLost(self,reason):
 		try:
-			data = json.loads(self.partial)
+			data = loads(self.partial)	#json.loads
 		except:
 			print "JSON error",self.partial
 			self.deferred.errback(["JSON data couldn't be loaded properly",self.partial[-20:]])
