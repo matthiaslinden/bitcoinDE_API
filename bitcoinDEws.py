@@ -38,7 +38,8 @@ from struct import unpack	# Websocket Length handling
 
 from twisted.python import log
 
-from twisted.internet import reactor,ssl,endpoints
+from twisted.internet import endpoints,reactor	# unfortunately reactor is neede in ClientIo0916Protocol
+from twisted.internet.ssl import optionsForClientTLS
 from twisted.internet.defer import Deferred, DeferredList
 from twisted.internet.protocol import Protocol, ClientFactory
 from twisted.protocols import basic
@@ -48,10 +49,13 @@ class ClientIo0916Protocol(basic.LineReceiver):
 	_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"	# Handshake key signing
 	
 	def connectionMade(self):
+		
 		self.state = 0
 		self.http_pos = ""
 		self.http_length = 0
 		self.pingcount = 0
+		
+		self.reconnectcount = 0
 		
 		self.setLineMode()
 		print "connectionMade"
@@ -101,6 +105,7 @@ class ClientIo0916Protocol(basic.LineReceiver):
 		if self.state == 2:
 			self.state = 3
 		elif self.state == 3:
+			# Calculate the length
 			l,b = ord(data[1])&(0b1111111),2	# Handle the length field
 			if l == 126:
 				b = 4
@@ -108,8 +113,9 @@ class ClientIo0916Protocol(basic.LineReceiver):
 			elif l == 127:
 				b = 10
 				l = unpack('!Q',data[2:10])[0]
+		# Different Opcodes
 			if data[b] == "1":
-				pass
+				print data
 			elif data[b] == "2":
 				self.pingcount += 1
 				#print "ping"
@@ -118,6 +124,8 @@ class ClientIo0916Protocol(basic.LineReceiver):
 			else:
 				print "unknown opcode",data
 			reactor.callLater(25,self.Heartbeat)
+		else:
+			print "Unknwon state",self.state
 	
 	def lineReceived(self,line):
 		if "HTTP/1.1" in line:
@@ -160,7 +168,16 @@ class ClientIo0916Protocol(basic.LineReceiver):
 		print "Packet",length,data
 	
 	def connectionLost(self,reason):
-		print "connectionLost",reason
+		print "WSconnectionLost",reason
+		reactor.callLater(20,self.Reconnect)
+		
+	def Reconnect(self):
+		print "Try to reconnect",self.transport
+		self.state = 0
+		self.http_pos = ""
+		self.http_length = 0
+		self.reconnectcount += 1
+		self.transport.connect()
 		
 class WSjsonBitcoinDEProtocol(ClientIo0916Protocol):
 	def onPacketReceived(self,data,length):
@@ -195,6 +212,8 @@ class BitcoinDEProtocol(WSjsonBitcoinDEProtocol):
 			D = {"name":name,"args":args}
 			self.factory.updateOrder(D)
 		else:
+			# unknown Event skn {u'uid': u'0yybQJoIpggjfFWurrA.'}	
+			
 			print "unknown Event",name,args
 
 class BitcoinDEMarket(ClientFactory):
@@ -209,7 +228,7 @@ class BitcoinDEMarket(ClientFactory):
 		
 	def clientConnectionLost(self,connector,reason):
 		print "clientLost",connector,reason
-		# connector.connect()
+		#connector.connect()
 		
 	def clientConnectionFailed(self,connector,reason):
 		print "clientFailed",connector,reason
@@ -282,7 +301,7 @@ Mostly used as a proxy to the underlying subscription-aware factory."""
 	def __init__(self,reactor):
 		self.reactor = reactor
 		
-		tlsctx = ssl.optionsForClientTLS(u'ws.bitcoin.de',None)
+		tlsctx = optionsForClientTLS(u'ws.bitcoin.de',None)
 		endpoint = endpoints.SSL4ClientEndpoint(self.reactor, 'ws.bitcoin.de', 443,tlsctx)
 		self.factory = BitcoinDESubscribeFactory()
 		endpoint.connect(self.factory)
@@ -301,9 +320,9 @@ Mostly used as a proxy to the underlying subscription-aware factory."""
 		return self.factory.SubscribeUpdate(func)
 
 def main():
-	
+	from twisted.internet import reactor,ssl
 	# Simple 'TrackMarket' example displaying all events processed
-	tlsctx = ssl.optionsForClientTLS(u'ws.bitcoin.de',None)
+	tlsctx = optionsForClientTLS(u'ws.bitcoin.de',None)
 	endpoint = endpoints.SSL4ClientEndpoint(reactor, 'ws.bitcoin.de', 443,tlsctx)
 	factory = TrackMarket()
 	endpoint.connect(factory)	

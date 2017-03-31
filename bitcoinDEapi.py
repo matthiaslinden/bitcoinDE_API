@@ -33,13 +33,12 @@ from hashlib import md5,sha256
 from hmac import new as hmac_new
 
 # Building upon twisted 
+from zope.interface import implements
 from twisted.web.iweb import IBodyProducer
-from twisted.internet.defer import Deferred
+from twisted.internet.defer import Deferred,succeed
 from twisted.web.client import Agent,readBody,WebClientContextFactory,HTTPConnectionPool
 from twisted.web.http_headers import Headers
-from twisted.internet import reactor
-from twisted.internet.protocol import Protocol
-	
+from twisted.internet.protocol import Protocol	
 
 class BitcoinDeAPI(object):
 	def __init__(self,reactor,api_key,api_secret):
@@ -121,7 +120,7 @@ class BitcoinDeAPI(object):
 		"""
 		encoded_string = ''
 		if params:
-			for key, value in sorted(params.iteritems()):
+			for key, value in sorted(params.iteritems(),key=lambda (key,value,) : key ):
 				encoded_string += str(key) + '=' + str(value) + '&'
 			encoded_string = encoded_string[:-1]
 			url = uri + '?' + encoded_string
@@ -148,7 +147,7 @@ class BitcoinDeAPI(object):
 		
 		bodyProducer = None
 		if method == 'POST':
-			bodyProducer = StringProducer(u''+encoded_string)
+			bodyProducer = StringProducer(encoded_string)
 			
 		d = self.agent.request(method,url,headers=h,bodyProducer=bodyProducer)
 		d.addCallback(self.APIResponse,eid=eid)
@@ -294,8 +293,9 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 	def IssueNext(self):
 	#	print "IssueNext",len(self.queue),len(self.pending)
 		self.wait_for_credits = 0
-		dt = 0.2	# Explicit pause inbetween two back to back request to avoid bad nonces
-		if self.CreditsAvailable(3):
+#		dt = 0.32	# Explicit pause inbetween two back to back request to avoid bad nonces
+		dt = 0.84
+		if self.EnoughCreditsAvailable(3):
 			for k,req in self.Queue():
 				if k not in self.pending.keys():
 					if req.attempts < 10:
@@ -340,10 +340,13 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 		if eid in self.pending.keys():
 			del self.pending[eid]
 	
-	def CreditsAvailable(self,credits):
+	def CreditsAvailable(self):
 		ct = time.time()
 		dt = ct-self.lasttime
-		available = min(20,self.lastcredits+dt)-sum(self.pending.values())
+		return min(20,self.lastcredits+dt)-sum(self.pending.values())
+	
+	def EnoughCreditsAvailable(self,credits):
+		available = self.CreditsAvailable()
 	#	print "inflight:",sum(self.pending.values()),"credits",available
 		if available > 2+credits:
 			return True
@@ -432,7 +435,8 @@ class PriorityBitcoinDeAPI(QueuedBitcoinDeAPI):
 		q = sorted(self.queue.items(),key=lambda x : (-x[1].priority,x[1].eid))
 		return q
 	
-class StringProducer(IBodyProducer):
+class StringProducer(object):
+	implements(IBodyProducer)
 	"""Produces POST request bodies"""
 	def __init__(self, body):
 		self.body = body
@@ -461,7 +465,7 @@ class BtcdeAPIProtocol(Protocol):
 		try:
 			data = loads(self.partial)	#json.loads
 		except:
-			print "JSON error",self.partial
+			print "JSON error",self.partial,reason
 			self.deferred.errback(["JSON data couldn't be loaded properly",self.partial[-20:]])
 		else:
 			self.deferred.callback(data)
