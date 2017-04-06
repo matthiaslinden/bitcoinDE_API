@@ -1,3 +1,6 @@
+#!/usr/bin/env python2.7
+#coding:utf-8
+
 ###############################################################################
 #
 # The MIT License (MIT)
@@ -24,10 +27,7 @@
 #
 ############################################################################### 
 
-#!/usr/bin/env python2.7
-#coding:utf-8
-
-import time
+from time import time
 #import sys
 from hashlib import sha1
 from json import loads
@@ -41,7 +41,8 @@ from twisted.python import log
 from twisted.internet import endpoints,reactor	# unfortunately reactor is neede in ClientIo0916Protocol
 from twisted.internet.ssl import optionsForClientTLS
 from twisted.internet.defer import Deferred, DeferredList
-from twisted.internet.protocol import Protocol, ClientFactory
+from twisted.internet.protocol import Protocol, Factory
+from twisted.application.internet import ClientService
 from twisted.protocols import basic
 
 class ClientIo0916Protocol(basic.LineReceiver):
@@ -53,18 +54,23 @@ class ClientIo0916Protocol(basic.LineReceiver):
 		self.state = 0
 		self.http_pos = ""
 		self.http_length = 0
-		self.pingcount = 0
 		
-		self.reconnectcount = 0
+		self.pongcount = 0
+		self.pingcount = 0
+		self.lastpingat = 0
+		self.pinginterval = 0
 		
 		self.setLineMode()
 		print "connectionMade"
-		data = "GET /socket.io/1/?t=%d HTTP/1.1\n"%(time.time()*1000)
+		data = "GET /socket.io/1/?t=%d HTTP/1.1\n"%(time()*1000)
 		self.sendLine(data)
 		
 	def Heartbeat(self):
+		self.pongcount += 1
 		pong = bytearray([129,3])+bytes("2::")
+	#	pong = bytearray([1,3])+bytes("2::") # Produces more reconnects 
 		self.transport.write(bytes(pong))
+	
 	
 	def ParseHTTP(self,line):
 		nonce,t1,t2,options = line.split(":")
@@ -102,6 +108,7 @@ class ClientIo0916Protocol(basic.LineReceiver):
 				self.http_pos = ""
 	
 	def rawDataReceived(self,data):
+	#	print bin(ord(data[0])),(ord(data[0])&0b1110)/2
 		if self.state == 2:
 			self.state = 3
 		elif self.state == 3:
@@ -118,7 +125,8 @@ class ClientIo0916Protocol(basic.LineReceiver):
 				print data
 			elif data[b] == "2":
 				self.pingcount += 1
-				#print "ping"
+				self.ProcessPing(data[b:])
+					
 			elif data[b] == "5":
 				self.onPacketReceived(data[b:],l-b)
 			else:
@@ -126,6 +134,15 @@ class ClientIo0916Protocol(basic.LineReceiver):
 			reactor.callLater(25,self.Heartbeat)
 		else:
 			print "Unknwon state",self.state
+	
+	def ProcessPing(self,data):
+		since = 0
+		now = time()
+		if self.lastpingat != 0:
+			since = now-self.lastpingat
+			self.pinginterval = since
+		self.lastpingat = now
+#		print "---> ping",self.pingcount,"%0.2f"%since,"\t",data
 	
 	def lineReceived(self,line):
 		if "HTTP/1.1" in line:
@@ -160,24 +177,16 @@ class ClientIo0916Protocol(basic.LineReceiver):
 				print "Should never happen",len(line),line
 		else:
 			print "unexpected:",line
-	
+	# 
 	def Terminate(self,reason):
-		print "Terminate",reason
+	 	print "Terminate",reason
 		
 	def onPacketReceived(self,data,length):
 		print "Packet",length,data
 	
 	def connectionLost(self,reason):
 		print "WSconnectionLost",reason
-		reactor.callLater(20,self.Reconnect)
-		
-	def Reconnect(self):
-		print "Try to reconnect",self.transport
-		self.state = 0
-		self.http_pos = ""
-		self.http_length = 0
-		self.reconnectcount += 1
-		self.transport.connect()
+
 		
 class WSjsonBitcoinDEProtocol(ClientIo0916Protocol):
 	def onPacketReceived(self,data,length):
@@ -190,6 +199,12 @@ class WSjsonBitcoinDEProtocol(ClientIo0916Protocol):
 		
 	def onEvent(self,name,args):
 		print "Implement onEvent!"
+		
+	def Terminate(self,reason):
+	 	print "WSjson Terminate",reason
+    
+	def connectionLost(self,reason):
+		print "WSjson connectionLost",reason
 	
 class BitcoinDEProtocol(WSjsonBitcoinDEProtocol):
 	def __init__(self):
@@ -211,12 +226,18 @@ class BitcoinDEProtocol(WSjsonBitcoinDEProtocol):
 			# refresh_express_option {u'4120760': {u'is_trade_by_sepa_allowed': u'0', u'is_trade_by_fidor_reservation_allowed': u'1'}}
 			D = {"name":name,"args":args}
 			self.factory.updateOrder(D)
-		else:
-			# unknown Event skn {u'uid': u'0yybQJoIpggjfFWurrA.'}	
 			
+		elif name == "skn":
+			# unknown Event skn {u'uid': u'0yybQJoPJQkkfFW7rsg.'}	16:24
+			# unknown Event skn {u'uid': u'0yybQJoIpggjfFWurrA.'}
+			self.factory.skn(args.get("uid",""))
+		else:
+				
 			print "unknown Event",name,args
+			
+	
 
-class BitcoinDEMarket(ClientFactory):
+class BitcoinDEMarket(Factory):
 	"""Simple factory that holds an orderbook"""
 	protocol = BitcoinDEProtocol
 	
@@ -224,14 +245,7 @@ class BitcoinDEMarket(ClientFactory):
 		self.Orderbook = {}
 	
 	def startedConnecting(self,connector):
-		print "Connected",connector
-		
-	def clientConnectionLost(self,connector,reason):
-		print "clientLost",connector,reason
-		#connector.connect()
-		
-	def clientConnectionFailed(self,connector,reason):
-		print "clientFailed",connector,reason
+		print "\tServerWS\tConnected",connector
 	
 	def addOrder(self,args):
 		print "addOrder",args
@@ -247,8 +261,11 @@ class BitcoinDEMarket(ClientFactory):
 			
 	def updateOrder(self,args):
 		pass
-			
-class BitcoinDESubscribeFactory(ClientFactory):
+		
+	def skn(self,uid):
+		pass
+	
+class BitcoinDESubscribeFactory(Factory):
 	"""Factory that enables subscription services for marketchanges. Registers callbacks to add/rm/management."""
 	protocol = BitcoinDEProtocol
 	def __init__(self):
@@ -256,20 +273,29 @@ class BitcoinDESubscribeFactory(ClientFactory):
 		self.rmfunc = []
 		self.mngmtfunc = []
 		self.updatefunc = []
+		
+		self.counter = {"add":0,"remove":0,"taken":0,"update":0,"skn":0}
 	
-	def clientConnectionLost(self,connector,reason):
-		for func in self.mngmtfunc:
-			func(connector,reason)
+	def startedConnecting(self,connector):
+		print "\tServerWS\tConnected",connector
+			
+	def Lost(self):
+		print "\tServerWS client called lost"
+	
+	def connectionLost(self,connector,reason):
+		print "\tServerWS connectionList",connector,reason
 	
 	def addOrder(self,args):
 		args["update"] = "add"
 		for func in self.addfunc:
 			func(args)
+		self.counter["add"] += 1
 			
 	def updateOrder(self,args):
 		args["update"] = "update"
 		for func in self.updatefunc:
 			func(args)
+		self.counter["update"] += 1
 			
 	def removeOrder(self,args):
 	# 0yzjOGFy3vQgfFm0re8. is the special 'reason'-id for removed trades
@@ -277,9 +303,18 @@ class BitcoinDESubscribeFactory(ClientFactory):
 		reason = args.get("reason",None)
 		if reason == "0yzjOGFy3vQgfFm0re8.":
 			args["reason"] = "remove"
+			self.counter["remove"] += 1
+		else:
+			self.counter["taken"] += 1
+			
 		args["update"] = "remove"
 		for func in self.rmfunc:
 			func(args)
+			
+	def skn(self,uid):
+		for func in self.mngmtfunc:
+			func({"action":"skn","uid":uid})
+		self.counter["skn"] += 1
 			
 	def SubscribeAdd(self,func):
 		self.addfunc.append(func)
@@ -301,10 +336,14 @@ Mostly used as a proxy to the underlying subscription-aware factory."""
 	def __init__(self,reactor):
 		self.reactor = reactor
 		
+		print "BitcoinDESubscribeFactory - constructor"
+		
 		tlsctx = optionsForClientTLS(u'ws.bitcoin.de',None)
-		endpoint = endpoints.SSL4ClientEndpoint(self.reactor, 'ws.bitcoin.de', 443,tlsctx)
+		self.endpoint = endpoints.SSL4ClientEndpoint(self.reactor, 'ws.bitcoin.de', 443,tlsctx)
 		self.factory = BitcoinDESubscribeFactory()
-		endpoint.connect(self.factory)
+		
+		self.connService = ClientService(self.endpoint,self.factory)
+		self.connService.startService()
 	
 # Proxies
 	def SubscribeAdd(self,func):
@@ -324,8 +363,10 @@ def main():
 	# Simple 'TrackMarket' example displaying all events processed
 	tlsctx = optionsForClientTLS(u'ws.bitcoin.de',None)
 	endpoint = endpoints.SSL4ClientEndpoint(reactor, 'ws.bitcoin.de', 443,tlsctx)
-	factory = TrackMarket()
-	endpoint.connect(factory)	
+	factory = BitcoinDEMarket()
+	
+	connService = ClientService(endpoint,factory)
+	connService.startService()
 	
 	reactor.run()
 	
