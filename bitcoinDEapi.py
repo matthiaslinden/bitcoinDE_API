@@ -40,6 +40,24 @@ from twisted.web.client import Agent,readBody,WebClientContextFactory,HTTPConnec
 from twisted.web.http_headers import Headers
 from twisted.internet.protocol import Protocol	
 
+# How it works:
+# 
+# - BitcoinDeAPI get's requests via APIRequest(call,**kwargs) and checks valdity of call and arguments (some) 
+#    The Request is then encoded in the bitcoin.de-API-complient format and handled over to a request-agent (twisted.web.client.Agent)
+#    The agent's deferred is returned, The whole class lays a base for a request-queue (with priority)
+#    The nonce is handled here as well as revocery from nonce-error
+# 
+# - BitcoinDeAPINonce improves the nonce-error handling in case of back-to-back requests which might arrive out of order
+# - QueuedBitcoinDeAPI implements a request-queue, delaying calls if no credits are available
+#    in addition the same requests (call,params hash) aren't added multiple times to the queue,
+#    but the original request's deferred is shared with the new request (hiding abstraction from the user)
+# - PriorityBitcoinDeAPI orders the queue by a priority
+#
+# - BtcdeAPIProtocol is used in 'response.deliverBody(...)' to parse the request's response
+# - StringProducer handles body-generation for POST-Requests
+
+# TODO 03.06.2017: Track Down error handling for Protocol JSON error
+
 class BitcoinDeAPI(object):
 	def __init__(self,reactor,api_key,api_secret):
 		# Bitcoin.de API URI
@@ -67,7 +85,7 @@ class BitcoinDeAPI(object):
 		self.calls['showOrderbookCompact'] = ['GET',orderuri+'/compact',{},3]
 		self.calls['createOrder'] = ['POST',orderuri,{'type':['sell','buy'],'max_amount':[],'price':[]},1]
 		self.calls['deleteOrder'] = ['DELETE',orderuri,{'order_id':[]},2]
-		self.calls['showMyOrders'] = ['GET',orderuri+'/my_own',{'type':['sell','buy']},2]
+		self.calls['showMyOrders'] = ['GET',orderuri+'/my_own',{},2]	# Fix: all arguments are optional
 		self.calls['showMyOrderDetails'] = ['GET',orderuri,{'order_id':[]},2]
 		# Trades
 		self.calls['executeTrade'] = ['POST',tradeuri,{'order_id':[],'amount':[]},1]
@@ -151,6 +169,10 @@ class BitcoinDeAPI(object):
 			
 		d = self.agent.request(method,url,headers=h,bodyProducer=bodyProducer)
 		d.addCallback(self.APIResponse,eid=eid)
+		
+		def Error(result):
+			print "API-Connect-Error",result
+		d.addErrback(Error)
 		return d
 	
 	def APIResponse(self,response,eid):
@@ -168,6 +190,11 @@ class BitcoinDeAPI(object):
 		else:
 			print response.code
 			finished.addCallback(self.DequeueAPIErrors,eid=eid,header=header)
+			
+		def Error(result):
+			print "APIResponse DeferredError after code %d"%(response.code)
+		finished.addErrback(Error)
+		
 		return finished
 		
 	def DequeueAPIRequest(self,response,eid,header):
@@ -271,12 +298,24 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 		self.lasttime = time.time()
 		self.lastcredits = 5
 		self.retryperiode = 3
+		self.max_seen = 8
+		
+		self.credits_spent = 0
+		
+		# Hack to make CalcHash create unique values on demand
+		self.unique_salt = 0
 	
 	def CalcHash(self,method,uri,params):
+		"""if unique=True is passed as param, an additional salt is added	"""
 		h = 0
 		for p in params.values():
 			h += hash(p)
-		return hash(method)+hash(uri)+h
+		unique = params.pop("unique",False)
+		if unique == True:
+			self.unique_salt = (self.unique_salt+59999)%60013
+			h += self.unique_salt
+		ha = hash(method)+hash(uri)+h
+		return ha
 		
 	def SameHashInQueue(self,h):
 		"""Return an already queued Request if it has similar hash to the requested one """
@@ -294,13 +333,15 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 	#	print "IssueNext",len(self.queue),len(self.pending)
 		self.wait_for_credits = 0
 #		dt = 0.32	# Explicit pause inbetween two back to back request to avoid bad nonces
-		dt = 0.84
+#		dt = 0.54
+		dt = 0.4
 		if self.EnoughCreditsAvailable(3):
 			for k,req in self.Queue():
 				if k not in self.pending.keys():
 					if req.attempts < 10:
 						self.APIConnect(req.method,req.params,req.uri,k) # Chaining of APIResponse is done in this function, so returned deferred is not used.
 						self.pending[k] = req.credits
+						self.credits_spent += req.credits
 						req.Send()
 					else:
 						req.DeliverResult({"error":"too many unsuccesful attempts","attempts":req.attempts})
@@ -308,7 +349,7 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 					break
 		else:
 			dt = 2
-		if len(self.queue) > len(self.pending):
+		if len(self.queue) > len(self.pending):	# (double counting in queue and pending)
 			# Schedule Next Issue, either back to back or when enough credits should be available
 			self.ScheduleNextIssue(dt)
 		
@@ -343,7 +384,7 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 	def CreditsAvailable(self):
 		ct = time.time()
 		dt = ct-self.lasttime
-		return min(20,self.lastcredits+dt)-sum(self.pending.values())
+		return min(self.max_seen,self.lastcredits+dt)-sum(self.pending.values())
 	
 	def EnoughCreditsAvailable(self,credits):
 		available = self.CreditsAvailable()
@@ -352,6 +393,11 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 			return True
 		else:
 			return False
+	
+	def QueueCreditsAvailable(self):
+		""" Returns a value reflecting the number of credits available with regard to enqueued requests"""
+		queuecredits = [x.credits for x in self.queue.values()]
+		return max(len(self.queue),self.CreditsAvailable()-sum(queuecredits))
 	
 	def EnqueAPIRequest(self,method,params,uri,credits,priority):
 		finished = Deferred()
@@ -374,15 +420,23 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 	def APIResponse(self,response,eid):
 		"""Process Response.header and choose treatment of the body"""
 		finished = Deferred()
+		
+		def Error(result):
+			print "DeferredError after code %d"%(response.code)
+		finished.addErrback(Error)
+		
 		response.deliverBody(BtcdeAPIProtocol(finished))
 		req = self.queue[eid]
 		header = {"code":response.code,"phrase":response.phrase,"call":req.method+":"+req.uri,"reqID":eid}
 		if response.code == 200 or response.code == 201:
 			finished.addCallback(self.DequeueAPIRequest,eid=eid,header=header)
+			
 		else:
 			self.lastcredits -= self.pending[eid]
 			if response.code == 429 or response.code == 403:	# 403 might need some extra handling
-				retry = int(response.headers.getRawHeaders("Retry-After")[0])
+				if response.code == 403:
+					print "\n"+header+"\n"
+				retry = int(response.headers.getRawHeaders("Retry-After",[0])[0])
 				header["retry"] = retry
 				self.Reenqueue(eid)
 				self.ScheduleNextIssue(retry+3)
@@ -391,6 +445,7 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 			else:
 				d = finished.addCallback(self.DequeueAPIErrors,eid=eid,header=header)
 				if response.code == 400:
+					# TODO: response 400 can still have error codes like 27 (bad params, which should not lead to reenqueue)
 					self.Reenqueue(eid)
 					self.ScheduleNextIssue()
 				else:
@@ -398,6 +453,8 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 					d.addCallback(req.DeliverResult)	# Don't know if this is a problem, that req.DeliverResult is called, but the request is removed from the queue
 					del self.pending[eid]
 					del self.queue[eid]
+					
+					
 				
 		return finished
 		
@@ -408,6 +465,8 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 		response["attempts"] = req.attempts
 		
 		credits = response.get("credits",0)
+		if credits > self.max_seen:
+			self.max_seen = credits
 		self.lasttime = time.time()
 		self.lastcredits = credits
 		
@@ -429,6 +488,9 @@ class QueuedBitcoinDeAPI(BitcoinDeAPINonce):
 			- As Requests might take some time due to limited credits, pages are requested in blocks 
 		"""
 		pass
+		
+	def Status(self):
+		return {"total_spent":self.credits_spent,"max":self.max_seen,"hot":self.QueueCreditsAvailable(),"avail":self.CreditsAvailable()}
 		
 class PriorityBitcoinDeAPI(QueuedBitcoinDeAPI):
 	def Queue(self):
@@ -463,9 +525,200 @@ class BtcdeAPIProtocol(Protocol):
 		
 	def connectionLost(self,reason):
 		try:
-			data = loads(self.partial)	#json.loads
+			if len(self.partial) > 0:
+				data = loads(self.partial)	#json.loads
+			else:
+				print "API-Connection lost, but no data was received, didn't attempt JSON decode",reason
 		except:
 			print "JSON error",self.partial,reason
 			self.deferred.errback(["JSON data couldn't be loaded properly",self.partial[-20:]])
 		else:
 			self.deferred.callback(data)
+
+class MultipageFetchSession(object):
+	"""
+	a page_callback(items,progress) function can be passed.
+Two Issues are adressed:
+* Ensure that a complete dataset is fetched --> Constantly query page 1 and check for changes, if change occures, reissue the last burst.
+* End after no new items occur --> ProcessPage-callback returns true if no more data is needed
+"""
+	_next_session = 0
+	def __init__(self,api,cmd,page_callback=lambda x,y:False,complete=False,**kwargs):
+		MultipageFetchSession._next_session += 1
+		self.sessionID = MultipageFetchSession._next_session
+		self.deferred = Deferred()
+	#	self.deferred.addErrback(self.Errback,{"error":"global error","cmd":cmd,"sid":self.sessionID})
+
+		# Basic config
+		self.api = api
+		self.cmd = cmd
+		self.complete = complete	# Ensure completeness of data that is fetched by constantly checking for new data
+		self.params = kwargs
+
+		# derrived config
+		self.bsize = int(max(3,(api.max_seen - 12)/3))	# Calculate number of sizes of the burst
+
+		print "Session %d"%self.sessionID,self.cmd,self.params,"burstsize:",self.bsize
+
+		# session-tracking
+		self.pages_fetched = {} # page -> number of times fetched
+		self.pages_pending = {}	# page -> deferred dict
+		self.revert = False
+
+		# Data Tracking
+		self.items = {}
+
+		# Per Page callback
+		self.page_callback = page_callback	# per Page-results callback, if one returns True in a burst, finish fetching!
+		self.burst_pages = {} # dict of page --> finished [true/false]
+
+		# Start First call
+		self.FetchPage(1,unique=True)
+
+	def AddCallback(self,callback):
+		self.deferred.addCallback(callback)
+
+	def FetchPage(self,page,unique = False):
+		"""Issue fetching a single page"""
+		deferred = self.api.APIRequest(self.cmd,page=page,unique=unique,**self.params).addErrback(self.DErrPage,page=page)
+		deferred.addCallback(self.DGetPage,page=page)
+		self.pages_pending[page] = deferred
+
+	def Errback(self,result):
+		print "Errback",result,page
+		return
+
+	def DErrPage(self,page):
+		self.revert = True
+
+	def DGetPage(self,result,page=0):
+		code = result.pop("code",None)
+		if code == None:
+			print "DGetPage has no code",result.keys()
+		phrase = result.pop("phrase","")
+		errors = result.pop("errors",None)
+		pages = result.pop("page",None)
+
+	# Handle page
+		try:
+			if pages == None:
+				self.pages_pending = {}
+				self.burst_pages = {}
+				self.revert = True
+			else:
+				self.pages_pending.pop(page,None)
+				fpage = self.pages_fetched.get(page,None)
+				if fpage == None:
+					self.pages_fetched[page] = 0
+				self.pages_fetched[page] += 1
+
+				print "\nSuccess",code,phrase,page,pages,result.get("call")
+	#		print result.keys()
+	#		print self.pages_fetched,self.pages_pending
+
+			# Process Results (Check if callback want's more data, register items, count unknowns)
+				p = {"fetched":self.pages_fetched,"pages":pages,"items":len(self.items)} # 'Progress'
+				pitems = self.ProcessPageResults(result)	# Returns a dict of hash --> item for the current page
+				pfinished = self.page_callback(result,p)	# Feed the dictified result to the callback, which decides if it want's more pages
+				self.burst_pages[page] = pfinished		# Register finishing request for this burst
+				unknowns = self.RegisterPageResults(pitems)	# Store results, get number of previously unknown items
+
+				if pfinished == False:		# If the callback want's more data, check if page 1 indicates changed data
+					if page == 1:
+						if unknowns > 0:
+							self.revert = True	
+
+		# Issue new Fetches
+			if len(self.pages_pending) == 0 :
+				fpages = []
+				# If revert = True, refetch last burst
+				if self.revert == True and self.complete == True: 
+					fpages = self.burst_pages.keys() # Redo last fetch
+					if 1 not in fpages:				 # Ensure page 1 is present
+						fpages.append(1)
+				else:
+					maxfetched,lastpage = max(self.pages_fetched.keys()),pages["last"]	# sets Range to be fetched
+					self.burst_pages.pop(1,None)	# Don't care if page 1 returned "finished" from callback
+					finished = False
+					for pf in self.burst_pages.values():
+						if pf == True:
+							finished = True
+					if finished != True and maxfetched < lastpage:
+						fpages = range(maxfetched+1,min(maxfetched+1+self.bsize,lastpage+1))
+						if self.complete == True and 1 not in fpages:
+							fpages.append(1)
+					else:
+						self.deferred.callback(self.items)
+						print "Finished",self.pages_fetched
+
+				# Reset for new Burst
+				self.burst_pages = {}	# Reset Burst
+				self.revert = False
+				# Issue new Burst
+				for p in fpages:
+					if p == 1:
+						self.FetchPage(p,unique=True)
+					else:
+						self.FetchPage(p)
+
+		except Exception as e:
+			import sys, os, traceback
+			print "DGetPage had an error"
+			exc_type, exc_obj, exc_tb = sys.exc_info()
+	#			fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+			print exc_type, exc_tb.tb_lineno, exc_tb
+			traceback.print_tb(exc_tb)
+			self.deferred.errback(e)
+
+	def ProcessPageResults(self,result):
+		print "Implement ProcessPageResults"
+
+	def RegisterPageResults(self,items):
+		unknowns = 0
+		for h,item in items.items():
+			oitem = self.items.get(h,None)
+			if oitem == None:
+				unknowns += 1
+			self.items[h] = item
+		return unknowns
+
+class FetchLedger(MultipageFetchSession):
+	def __init__(self,api,complete=False,**kwargs):
+		super(FetchLedger,self).__init__(api,"showAccountLedger",complete=complete,**kwargs)
+
+	def ProcessPageResults(self,result):
+		ledger = result.get(u'account_ledger',None)
+		items = {}
+		if ledger != None:
+			for item in ledger:
+				h = hash(item["date"])+hash(item["cashflow"])+hash(item["type"])
+				if h in items.keys():
+					print "Double",item
+				items[h] = item
+		return items
+
+class FetchMyTrades(MultipageFetchSession):
+	def __init__(self,api,complete=False,**kwargs):
+		super(FetchMyTrades,self).__init__(api,"showMyTrades",complete=complete,**kwargs)
+
+	def ProcessPageResults(self,result):
+		trades = result.get(u'trades',None)
+		items = {}
+		if trades != None:
+			for trade in trades:
+				tid = trade.get(u'trade_id')
+				items[tid] = trade
+		return items
+
+class FetchMyOrders(MultipageFetchSession):
+	def __init__(self,api,complete=False,**kwargs):
+		super(FetchMyOrders,self).__init__(api,"showMyOrders",complete=complete,**kwargs)
+
+	def ProcessPageResults(self,result):
+		orders = result.get(u'orders',None)
+		items = {}
+		if orders != None:
+			for order in orders:
+				oid = order.get(u'order_id')
+				items[oid] = order
+		return items
