@@ -28,7 +28,6 @@
 ############################################################################### 
 
 from time import time
-#import sys
 from hashlib import sha1
 from json import loads
 
@@ -38,7 +37,7 @@ from struct import unpack	# Websocket Length handling
 
 from twisted.python import log
 
-from twisted.internet import endpoints,reactor	# unfortunately reactor is neede in ClientIo0916Protocol
+from twisted.internet import endpoints,reactor			# unfortunately reactor is neede in ClientIo0916Protocol
 from twisted.internet.ssl import optionsForClientTLS
 from twisted.internet.defer import Deferred, DeferredList
 from twisted.internet.protocol import Protocol, Factory
@@ -46,12 +45,14 @@ from twisted.application.internet import ClientService
 from twisted.protocols import basic
 
 class ClientIo0916Protocol(basic.LineReceiver):
-	
+	"""Implements a receiver able to interact with the websocket part of a JS clientIO server.
+Requests options from the clientIO server and if websocket is avaiable, upgrades the connection 'talk' websocket.
+After actin as a basic.LineReceiver to process the http GET,UPGRADE part (lineReceived), switch to RAW mode (rawDataReceived)."""
 	_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"	# Handshake key signing
 	
 	def connectionMade(self):
-		
-		self.state = 0
+		""" Called after the factory that was passed this protocol established the connection. """
+		self.state = 0		# pseudo state-machine to keep track which phase http-upgrade-websocket the connection is in
 		self.http_pos = ""
 		self.http_length = 0
 		
@@ -60,10 +61,9 @@ class ClientIo0916Protocol(basic.LineReceiver):
 		self.lastpingat = 0
 		self.pinginterval = 0
 		
-		self.setLineMode()
-		print "connectionMade"
+		self.setLineMode()	# for the http part, process the packet line-wise
 		data = "GET /socket.io/1/?t=%d HTTP/1.1\n"%(time()*1000)
-		self.sendLine(data)
+		self.sendLine(data)	# first GET request
 		
 	def Heartbeat(self):
 		self.pongcount += 1
@@ -73,6 +73,7 @@ class ClientIo0916Protocol(basic.LineReceiver):
 	
 	
 	def ParseHTTP(self,line):
+		"""Processes the response to the GET Request and create the UPGRADE Request"""
 		nonce,t1,t2,options = line.split(":")
 		if "websocket" in options:
 			if len(nonce) == 20:
@@ -145,7 +146,8 @@ class ClientIo0916Protocol(basic.LineReceiver):
 #		print "---> ping",self.pingcount,"%0.2f"%since,"\t",data
 	
 	def lineReceived(self,line):
-		if "HTTP/1.1" in line:
+		"""Parse the http Packet (linewise) and switch states accordingly"""
+		if "HTTP/1.1" in line:	# First line in response
 			lc = line.split(" ")
 			http,code,phrase = lc[0],int(lc[1])," ".join(lc[2:])
 			if code == 200:
@@ -171,8 +173,8 @@ class ClientIo0916Protocol(basic.LineReceiver):
 				if line.split(" ")[1] != "websocket":
 					self.Terminate(["Upgrade to websocket failed",line])
 		elif self.state == 2:
-			if line == "":		
-				self.setRawMode()	# Wait for the packet to end
+			if line == "":		# Wait for the packet to end
+				self.setRawMode()	
 			else:
 				print "Should never happen",len(line),line
 		else:
@@ -182,6 +184,7 @@ class ClientIo0916Protocol(basic.LineReceiver):
 	 	print "Terminate",reason
 		
 	def onPacketReceived(self,data,length):
+		""" Dummy, implement Your own websocket-packet-processing"""
 		print "Packet",length,data
 	
 	def connectionLost(self,reason):
@@ -189,50 +192,102 @@ class ClientIo0916Protocol(basic.LineReceiver):
 
 		
 class WSjsonBitcoinDEProtocol(ClientIo0916Protocol):
+	""" Processes the Content of the Websocket packet treating it as JSON and pass the dict to an onEvent-function mimmicing the original js behaviour"""
 	def onPacketReceived(self,data,length):
 		i = 1
 		while data[i] == ":":
 			i+=1
 		jdata = loads(data[i:])	# json.loads
 		otype,args = jdata["name"],jdata["args"][0]
-		self.onEvent(otype,args)
+		self.onEvent(otype,args) # pass the JSON-dict to the handler
 		
 	def onEvent(self,name,args):
 		print "Implement onEvent!"
 		
 	def Terminate(self,reason):
 	 	print "WSjson Terminate",reason
-    
+
 	def connectionLost(self,reason):
 		print "WSjson connectionLost",reason
-	
+
+# * * * * * * * * * * * Example Implementation * * * * * * * * * * * #
+# Twisted uses Factories that listen/connect to sockets that 'speak' a protocol.
+# In this case, the market is implemented in the factory, but the incomming packets are processed in the protocol and call the appropriate add/rm function of the factory (through self.factory.add/removeOrder)
+
 class BitcoinDEProtocol(WSjsonBitcoinDEProtocol):
+	""" Simple Protocol to build a Market when used with BitcoinDEMarket(Factory)"""
 	def __init__(self):
 		self._iadd = ['uid','seat_of_bank_of_creator','id','type','payment_option','is_trade_by_fidor_reservation_allowed','bic_full','order_id','price','amount','min_amount','is_shorting_allowed','order_type','is_kyc_full','is_shorting','is_trade_by_sepa_allowed','fidor_account','min_trust_level','amount','only_kyc_full']
-		self._irem = ['trade_user_id', 'order_id', 'reason', 'type', 'id', 'order_type','amount','price']
+		self._irem = ['trade_user_id', 'order_id', 'reason', 'type', 'id', 'order_type','amount','price','seller_id','buyer_id']
 		
 	def onEvent(self,name,args):
+		D = {"pair":args.pop('trading_pair',None)}
 		if name == "add_order":
-			D = {}
 			for a in self._iadd:
 				D[a] = args.get(a,"")
 			self.factory.addOrder(D)
+
 		elif name == "remove_order":
-			D = {}
+		#	print "remove",args.get('seller_id'),args.get('buyer_id'),args.get('trade_user_id')
 			for a in self._irem:
 				D[a] = args.get(a,"")
+				
 			self.factory.removeOrder(D)
+				
 		elif name == "refresh_express_option":
 			# refresh_express_option {u'4120760': {u'is_trade_by_sepa_allowed': u'0', u'is_trade_by_fidor_reservation_allowed': u'1'}}
-			D = {"name":name,"args":args}
-			self.factory.updateOrder(D)
-			
+			self.factory.updateOrder(args)
+		
+		elif name == "spr":
+			pass
+		
 		elif name == "skn":
-			# unknown Event skn {u'uid': u'0yybQJoPJQkkfFW7rsg.'}	16:24
-			# unknown Event skn {u'uid': u'0yybQJoIpggjfFWurrA.'}
 			self.factory.skn(args.get("uid",""))
 		else:
-				
+			# unknown Event skn {u'uid': u'0yybQJoPpA8hfFWgrro.'} Di 21.02. ~9 am
+			# unknown Event skn {u'uid': u'0yybQhmJJAkhfFWsrrQ.'}
+			# unknown Event skn {u'uid': u'0yybQJ4KpggnfFWyrrI.'}
+			# unknown Event skn {u'uid': u'0yybQJ6MJAkmfFWMrs8.'} same day ~10 am
+			# unknown Event skn {u'uid': u'0yybQJsOpIshfFWirrE.'}
+			# unknown Event skn {u'uid': u'0yybQB4Jow4jfFWIrsk.'} same day 13:43
+			# unknown Event skn {u'uid': u'0yybQJqLIAkmfFWCrsw.'}
+			# unknown Event skn {u'uid': u'0yybQp8JoAwhfFXwrqE.'}
+			# unknown Event skn {u'uid': u'0yybQBwNpY8lfFW-rso.'}
+			# unknown Event skn {u'uid': u'0yybQJ8NpAokfFXKrrs.'} 22.02. ~10 am
+			# unknown Event skn {u'uid': u'0yybQJqPoI8hfFW9rsk.'}
+			# unknown Event skn {u'uid': u'0yybQJqPpI8lfFWBrss.'} around the time ronvolk bought for his first time
+			# unknown Event skn {u'uid': u'0yybQJoPoA0lfFXarrg.'}
+			# unknown Event skn {u'uid': u'0yybQB4Now8hfFWCrrQ.'}
+			# unknown Event skn {u'uid': u'0yybQJ-MIAklfFWvrrQ.'}
+			# unknown Event skn {u'uid': u'0yybQJoJowkifFWjrr8.'}
+			# unknown Event skn {u'uid': u'0yybQJoIoAgmfFWqrrI.'}
+			# unknown Event skn {u'uid': u'0yybQJoIoAwgfFWprrA.'}
+			# unknown Event skn {u'uid': u'0yybQJ4OpQonfFWArrc.'}
+			# unknown Event skn {u'uid': u'0yybQJwJpwkhfFXRrqc.'}
+			# unknown Event skn {u'uid': u'0yybQJoIIA0kfFWyrrU.'}
+			# unknown Event skn {u'uid': u'0yybxZ2KlDkjVVE-'}
+			# unknown Event skn {u'uid': u'0yybwpkMpQogfFW8rrc.'} 23.02.
+			# unknown Event skn {u'uid': u'0yybQJqPIAklfFWArrc.'}
+			# unknown Event skn {u'uid': u'0yybQJ8LpwgjfFXZrr0.'}
+			# unknown Event skn {u'uid': u'0yybQJqPpAgifFWArsk.'}
+			# unknown Event skn {u'uid': u'0yybxJ0OookhfFW0rrQ.'}
+			# unknown Event skn {u'uid': u'0yybQpgJpQghfFXMrrg.'}
+			# unknown Event skn {u'uid': u'0yybRRoJID0hf2HhoA..'}
+			# unknown Event skn {u'uid': u'0yybQJoPpwsjfFWyrrE.'}
+			# unknown Event skn {u'uid': u'0yybQJoPpgwlfFWrrr8.'}
+			# unknown Event skn {u'uid': u'0yybQp8Kpw4lfFWirrE.'}
+			# unknown Event skn {u'uid': u'0yybQJ4Nljkje1Eu'}
+			# unknown Event skn {u'uid': u'0yybQ56NoDshf0rhqA..'}	16:15 ++
+			# unknown Event skn {u'uid': u'0yybQJ6PoA4gfFW8rsg.'}
+			# unknown Event skn {u'uid': u'0yybQJ4Moo8hfFWurrQ.'}
+			# unknown Event skn {u'uid': u'0yybQB4JpgwjfFW7rrQ.'}
+			# unknown Event skn {u'uid': u'0yybQJqNpIolfFW_rsw.'}
+			# unknown Event skn {u'uid': u'0yybQJoLpI8lfFWlrrI.'}
+			# unknown Event skn {u'uid': u'0yybQJoLow4nfFW2rrU.'}
+			# unknown Event skn {u'uid': u'0yybQJoPJQkkfFW7rsg.'}	16:24
+			# unknown Event skn {u'uid': u'0yybQJoIpggjfFWurrA.'}
+			
+			
 			print "unknown Event",name,args
 			
 	
@@ -304,10 +359,19 @@ class BitcoinDESubscribeFactory(Factory):
 		if reason == "0yzjOGFy3vQgfFm0re8.":
 			args["reason"] = "remove"
 			self.counter["remove"] += 1
+		elif reason == "0yxjWYBw2RVoMdjPhsLkivcyUrDYnJQ.":
+			print "OLD reason",args
+			args["reason"] = "remove"
+			self.counter["remove"] += 1
+# 00 [-] WSrmOrder failed to convert amount {'order_type': u'buy', 'order_id': u'MN89KY', 'price': '', 'amount': '', 'update': 'remove', 'reason': u'0yxjWYBw2RVoMdjPhsLkivcyUrDYnJQ.', 'type': u'order', 'id': u'4709746', 'trade_user_id': u'0yybxJ2NoA8mfFWzrrY.'}
+#2017-05-10 20:45:17+0200 [-] Unknown Reason None 0yxjWYBw2RVoMdjPhsLkivcyUrDYnJQ.
+		
+		
 		else:
 			self.counter["taken"] += 1
 			
 		args["update"] = "remove"
+		print self.counter
 		for func in self.rmfunc:
 			func(args)
 			
@@ -338,7 +402,7 @@ Mostly used as a proxy to the underlying subscription-aware factory."""
 		
 		print "BitcoinDESubscribeFactory - constructor"
 		
-		tlsctx = optionsForClientTLS(u'ws.bitcoin.de',None)
+		tlsctx = optionsForClientTLS(u'ws.bitcoin.de')#,trustRoot=None)
 		self.endpoint = endpoints.SSL4ClientEndpoint(self.reactor, 'ws.bitcoin.de', 443,tlsctx)
 		self.factory = BitcoinDESubscribeFactory()
 		
