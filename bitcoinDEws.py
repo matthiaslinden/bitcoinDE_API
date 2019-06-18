@@ -218,7 +218,7 @@ class WSjsonBitcoinDEProtocol(ClientIo0916Protocol):
 
 # * * * * * * * * * * * socket.io > 2.0 Implementation * * * * * * * * * * * #
 
-class ClientIo2011Protocl(basic.LineReceiver):
+class ClientIo2011Protocol(basic.LineReceiver):
 	_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"	# Handshake key signing
 	
 	def connectionMade(self):
@@ -356,7 +356,7 @@ class ClientIo2011Protocl(basic.LineReceiver):
 	def connectionLost(self,reason):
 		print("WSconnectionLost",reason)
 	
-class WSjsonBitcoinDEProtocol2(ClientIo2011Protocl):
+class WSjsonBitcoinDEProtocol2(ClientIo2011Protocol):
 	""" Processes the Content of the Websocket packet treating it as JSON and pass the dict to an onEvent-function mimmicing the original js behaviour"""
 	def onPacketReceived(self,data,length,t):
 		di = data.index(',')

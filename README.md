@@ -2,7 +2,7 @@
 Collection of functions to use bitcoin.de API in python, using twisted as asynchronous framework.
 
 ## API
-* Tested in python2.7
+* Tested in python2.7 
 * Implements all API-calls
 
 
@@ -24,18 +24,27 @@ In addition the JSON dict containing the response-body, the following fields are
 {code': 200, u'credits': 18, u'errors': [], 'phrase': 'OK'}
 
 ## socket.io
-bitoin.de supplies a 'websocket' interface to inform in realtime about changes to the marketplace. It's based on socket.io (version 09.16) and doesn't provide simple websocket connectivity.
+
+bitoin.de supplies a 'websocket' interface to inform in realtime about changes to the marketplace. It's based on socket.io (version 09.16 for ws. and ws1.bitcoin.de) and doesn't provide simple websocket connectivity.
+ws2. and ws3.bitcoin.de use version 2.0.11 of socket.io
+
+### Compatibility
+Tested in both python2.7 and python3.7 with latest twisted library
 
 ### Procedure
 * https Get request to base address returns connection-options (websocket,longpolling,...)
 * Switch to desired Protocol using the same https connection
 * Receive websocket packages, send heartbeat to keep connection open
 
+Implementations for 09.16 and 2.0.11 differ slightly.
+
 ### Implementation
 bitcoinDEws implementation uses twisted basic.LineReceiver to make the GET request to the base-address, some crude line-magic to process the response and initiate the protocol-switching. No real websocket implementation is used, but a line-oriented bare minimum.
 
-* ClientIo0916Protocol encapsulates the basic connection handling
-* WSjsonBitcoinDEProtocol adds JSON data handling
-* BitcoinDEProtocol adds awareness to the three types of events communicated and the relevant data
+* ClientIo0916Protocol/ClientIo2011Protocol encapsulates the basic connection handling
+* WSjsonBitcoinDEProtocol and -2 add JSON data handling
+* BitcoinWSSourceV09 and BitcoinWSSourceV20 implement Factories to handle each source
+* BitcoinWSmulti processes input from multiple sources (ws., ws1., ...)
+* Each event-type (add/rm/skn/po/spr) is implemented in it's own class
+* BitcoinDESubscribe offers a subscription service to add 'callbacks' for each event type, delivered through BitcoinWSmulti.Deliver, for use in async apps
 
-BitcoinDESubscribeFactory and BitcoinDESubscribe add callback-subscriptions to make data available in an async application
