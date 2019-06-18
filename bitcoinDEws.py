@@ -88,7 +88,6 @@ After actin as a basic.LineReceiver to process the http GET,UPGRADE part (lineRe
 				data += "Sec-WebSocket-Extensions: \r\n"
 			#	data += "Sec-WebSocket-Extensions: permessage-deflate\r\n";
 				data += "Pragma: no-cache\r\nCache-Control: no-cache\r\n"
-#				self.transport.write(data.encode('utf8'))
 				self.sendLine(data.encode('utf8'))
 				self.state = 1
 		
@@ -434,14 +433,16 @@ class Event(object):
 		return "Event %s %s %s"%(self.eventType,self.eventID,self.eventData)
 
 class bitcoinWSeventstream(object):
-	def __init__(self,stream):
+	"""Handles an Eventstream, for example 'add'-Events. ProcessEvent only forwards the first occurence of an event from one of the sources. Already received events get timestamd-data via AddSource"""
+	def __init__(self,stream,interval=60):
 		self.stream = stream
 		self.checktask = task.LoopingCall(self.Cleanup)
-		self.interval = 60
+		self.interval = interval	# Remove old Events from stream
 		self.checktask.start(self.interval,False)
 		self.events = {}
 	
 	def Cleanup(self):
+		"""Periodically removes old events from stream"""
 		now = time()
 		events = {}
 		n,m,dt,ll,srcl = 0,0,[1000,0,0],{},{}
@@ -592,6 +593,7 @@ class bitcoinWSrpo(bitcoinWSeventstream):
 		return pos
 
 class BitcoinWSmulti(object):
+	"""ClientService ensures restart after connection is lost."""
 	def __init__(self,servers=[1,2,3,4]):
 		self.servers = {1:("ws",BitcoinWSSourceV09,),2:("ws1",BitcoinWSSourceV09,),3:("ws2",BitcoinWSSourceV20,),4:("ws3",BitcoinWSSourceV20,)}
 	#	self.servers = {1:("ws1",BitcoinWSSourceV09,)}
@@ -621,8 +623,7 @@ class BitcoinWSmulti(object):
 		if stream != None:
 			evt = stream.ProcessEvent(data,src,t)
 		else:
-			
-			print("Event",src,evt,data,t2-t)
+			print("no Event stream for",src,evt,data,t2-t)
 			
 		if evt != None:
 			self.Deliver(evt)

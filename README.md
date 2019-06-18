@@ -46,5 +46,6 @@ bitcoinDEws implementation uses twisted basic.LineReceiver to make the GET reque
 * BitcoinWSSourceV09 and BitcoinWSSourceV20 implement Factories to handle each source
 * BitcoinWSmulti processes input from multiple sources (ws., ws1., ...)
 * Each event-type (add/rm/skn/po/spr) is implemented in it's own class
+* Each event-type is handled through a bitcoinWSeventstream, only forwarding first reception of an event from the sources
 * BitcoinDESubscribe offers a subscription service to add 'callbacks' for each event type, delivered through BitcoinWSmulti.Deliver, for use in async apps
 
