@@ -32,6 +32,8 @@ from time import time
 from hashlib import sha1
 from json import loads
 
+import re
+
 from os import urandom
 from base64 import b64encode,urlsafe_b64encode	# Websocket Key handling
 from struct import pack,unpack	# Websocket Length handling
@@ -92,7 +94,7 @@ class ClientIo24Protocol(basic.LineReceiver):
 		try:
 			sid = loads("{"+line.split("{")[1].split("}")[0]+"}")
 			self.sid = sid.get("sid",None)
-			self.pingInterval = sid.get("pingInterval",1100*20)/1100			
+			self.pingInterval = sid.get("pingInterval",1100*20)/1100
 		except:
 			sid = {}
 		return sid
@@ -179,9 +181,9 @@ class ClientIo24Protocol(basic.LineReceiver):
 				self.setLineMode()
 				self.sendUpgrade()
 		else:
-			self.DecodeWebsocket(data)
+			self.DecodeWebsocket(data,t)
 	
-	def DecodeWebsocket(self,data):
+	def DecodeWebsocket(self,data,t):
 		self.ws_packet_count += 1
 		l,b = data[1]&(0b1111111),2	# Handle the length field
 		op = data[0] & 0x0f
@@ -195,13 +197,9 @@ class ClientIo24Protocol(basic.LineReceiver):
 		if op == 1:
 			if self.state == ClientIo24State.websocket:
 				if data[b:] == "3".encode("utf-8"):
-					print("pong")
 					reactor.callLater(self.pingInterval,self.sendPing)
-				elif data[b:b+10] == b"42/market,":
-					pass
 				else:
-					print(data[b:])
-#					self.onPacketReceived()
+					self.onPacketReceived(data[b:],l-b,t)
 			elif self.state == ClientIo24State.upgrade:
 				if data[b:] == "3probe".encode("utf-8"):
 					reactor.callLater(1,self.WebsocketSend,"5".encode("utf-8"))
@@ -210,7 +208,7 @@ class ClientIo24Protocol(basic.LineReceiver):
 					self.state = ClientIo24State.websocket
 				else:
 					print("wrong probe response",data[b:])
-								
+					
 		else:
 			print("other op",op)	
 
@@ -231,11 +229,20 @@ class ClientIo24Protocol(basic.LineReceiver):
 class WSjsonBitcoinDEProtocol24(ClientIo24Protocol):
 	""" Processes the Content of the Websocket packet treating it as JSON and pass the dict to an onEvent-function mimmicing the original js behaviour"""
 	def onPacketReceived(self,data,length,t):
-		
-		pass # TODO
-#		di = data.index(',')
-#		evt,args = data[2:di-1],loads(data[di+1:-1])
-#		self.factory.onEvent(evt,args,t)
+		try:
+			content = data.decode("utf-8")
+		except:
+			dsplit = re.split(b'\x81~\x06',data)
+			if len(dsplit) > 1:
+				for d in dsplit:
+					self.onPacketReceived(d,len(d),t)
+			else:	# Recovery not possible, split doesn't yield two parts
+				pass
+		else:
+			ci = content.find('[',0,20)
+			if ci != -1:
+				evt,args = loads(content[ci:])
+				self.factory.onEvent(evt,args,t)
 		
 	def Terminate(self,reason):
 	 	print("WSjson Terminate",reason)
@@ -340,7 +347,7 @@ class bitcoinWSeventstream(object):
 			dt[0] = 0
 				
 		self.events = events
-		print("Cleanup",self.stream,n,m,map(lambda x : "%.6f"%x,dt),ll,srcl)
+		print("Cleanup",self.stream,n,m,[x for x in map(lambda x : "%.6f"%x,dt)],ll,srcl)
 	
 	def ProcessEvent(self,data,src,t):
 		eventID = self.GenerateID(data)
@@ -423,7 +430,7 @@ class bitcoinWSaddOrder(bitcoinWSeventstream):
 		po = int(data["payment_option"])
 		r = {"po":po,"short":short}
 		
-		print(fidor,sepa,po,short)
+#		print(fidor,sepa,po,short)
 		for k,v in self.trans.items():
 			t,f, = v
 			r[t] = f(data.get(k))
@@ -440,6 +447,13 @@ class bitcoinWSskn(bitcoinWSeventstream):
 class bitcoinWSspr(bitcoinWSeventstream):
 	def __init__(self):
 		super(bitcoinWSspr,self).__init__("spr")
+		
+	def GenerateID(self,data):
+		return data['uid']
+
+class bitcoinWSlt(bitcoinWSeventstream):
+	def __init__(self):
+		super(bitcoinWSlt,self).__init__("lt")
 		
 	def GenerateID(self,data):
 		return data['uid']
@@ -467,7 +481,7 @@ class bitcoinWSrpo(bitcoinWSeventstream):
 
 class BitcoinWSmulti(object):
 	"""ClientService ensures restart after connection is lost."""
-	def __init__(self,servers=[1]):
+	def __init__(self,servers=[1,2,3,4]):
 		self.servers = {1:("ws",BitcoinWSSourceV24,),2:("ws1",BitcoinWSSourceV24,),3:("ws2",BitcoinWSSourceV24,),4:("ws3",BitcoinWSSourceV24,)}
 	#	self.servers = {1:("ws1",BitcoinWSSourceV09,)}
 	#	self.servers = {3:["ws2",BitcoinWSSourceV20,]}
@@ -477,6 +491,7 @@ class BitcoinWSmulti(object):
 		self.streams = {"remove_order":bitcoinWSremoveOrder(),"add_order":bitcoinWSaddOrder()}
 		self.streams["skn"] = bitcoinWSskn()
 		self.streams["spr"] = bitcoinWSspr()
+		self.streams["lt"] = bitcoinWSlt()
 		self.streams["refresh_express_option"] = bitcoinWSrpo()
 		
 		for sid in servers:
@@ -488,21 +503,22 @@ class BitcoinWSmulti(object):
 				self.connService[sid] = ClientService(endpoint,self.sources[sid])
 				self.connService[sid].startService()
 	
-	def ReceiveEvent(self,evt,data,src,t):
+	def ReceiveEvent(self,devt,data,src,t):
 		# Called by source, dispatches to event Stream
 		t2 = time()
-		stream = self.streams.get(evt,None)
+		stream = self.streams.get(devt,None)
 		evt = None
 		if stream != None:
 			evt = stream.ProcessEvent(data,src,t)
 		else:
-			print("no Event stream for",src,evt,data,t2-t)
+			print("no Event stream for",src,devt,data,t2-t)
 			
 		if evt != None:
 			self.Deliver(evt)
 			
 	def Deliver(self,evt):
-		print(evt)
+		pass
+#		print(evt)
 		
 	def Stats(self):
 		pass
