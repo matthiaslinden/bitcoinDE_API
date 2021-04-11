@@ -27,226 +27,76 @@
 #
 ############################################################################### 
 
+from enum import Enum
 from time import time
 from hashlib import sha1
 from json import loads
 
 from os import urandom
-from base64 import b64encode	# Websocket Key handling
-from struct import unpack	# Websocket Length handling
+from base64 import b64encode,urlsafe_b64encode	# Websocket Key handling
+from struct import pack,unpack	# Websocket Length handling
 
 from twisted.python import log
 
-from twisted.internet import endpoints,reactor,task			# unfortunately reactor is neede in ClientIo0916Protocol
+from twisted.internet import endpoints,task,reactor
 from twisted.internet.ssl import optionsForClientTLS
 from twisted.internet.defer import Deferred, DeferredList
 from twisted.internet.protocol import Protocol, Factory
 from twisted.application.internet import ClientService
 from twisted.protocols import basic
 
+# Retiered socket.io v0.9.16 and v2.0.11 versions, as bitcoin.de doesn't supply them any more.
 
-class ClientIo0916Protocol(basic.LineReceiver):
-	"""Implements a receiver able to interact with the websocket part of a JS clientIO server.
-Requests options from the clientIO server and if websocket is avaiable, upgrades the connection 'talk' websocket.
-After actin as a basic.LineReceiver to process the http GET,UPGRADE part (lineReceived), switch to RAW mode (rawDataReceived)."""
+# * * * * * * * * * * * socket.io > 2.4 Implementation * * * * * * * * * * * #
+
+class ClientIo24State(Enum):
+	init = 0
+	sid = 1
+	upgrade = 2
+	websocket = 3
+	market = 4
+
+class ClientIo24Protocol(basic.LineReceiver):
 	_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"	# Handshake key signing
 	
 	def connectionMade(self):
-		""" Called after the factory that was passed this protocol established the connection. """
-		self.state = 0		# pseudo state-machine to keep track which phase http-upgrade-websocket the connection is in
-		self.http_pos = ""
-		self.http_length = 0
-		
-		self.pongcount = 0
-		self.pingcount = 0
-		self.lastpingat = 0
-		self.pinginterval = 0
-		
-		self.setLineMode()	# for the http part, process the packet line-wise
-		data = "GET /socket.io/1/?t=%d HTTP/1.1\n"%(time()*1000)
-		self.sendLine(data.encode('utf8'))	# first GET request
-		
-	def Heartbeat(self):
-		self.pongcount += 1
-		pong = bytearray([129,3])+b"2::"
-	#	pong = bytearray([1,3])+bytes("2::") # Produces more reconnects 
-		self.transport.write(bytes(pong))
-	
-	
-	def ParseHTTP(self,line):
-		"""Processes the response to the GET Request and create the UPGRADE Request"""
-		nonce,t1,t2,options = line.split(":")
-		if "websocket" in options:
-			if len(nonce) == 20:
-				key = b64encode(urandom(16))
-				self.websocket_key = key.decode('utf8')
-				data = "GET /socket.io/1/websocket/%s HTTP/1.1\r\n"%nonce
-			#	data += "Accept-Encoding: gzip, deflate, sdch"
-				data += "Connection: Upgrade\r\nUpgrade: websocket\r\n"
-				data += "Sec-WebSocket-Key: %s\r\n"%(self.websocket_key)
-				data += "Sec-WebSocket-Version: 13\r\n"
-				data += "Sec-WebSocket-Extensions: \r\n"
-			#	data += "Sec-WebSocket-Extensions: permessage-deflate\r\n";
-				data += "Pragma: no-cache\r\nCache-Control: no-cache\r\n"
-				self.sendLine(data.encode('utf8'))
-				self.state = 1
-		
-	def eatUpHTTP(self,line):
-		if self.http_pos == "head":
-			if line == "":
-				self.http_pos = "length"
-		elif self.http_pos == "length":
-			self.http_length = int(line)
-			self.http_pos = "content"
-		elif self.http_pos == "content":
-			if line != "":
-				self.ParseHTTP(line)
-				self.http_length -= len(line)
-				if self.http_length <= 0:
-					self.http_pos = "tail"
-			else:
-				self.http_pos = "tail"
-		elif self.http_pos == "tail":
-			if line == "":
-				self.http_pos = ""
-	
-	def rawDataReceived(self,data):
-		t = time()
-		if type(data) == str:
-			data = bytearray(data)
-		if self.state == 2:
-			self.state = 3
-		elif self.state == 3:
-			# Calculate the length
-			l,b = data[1]&(0b1111111),2	# Handle the length field
-	
-			if l == 126:
-				b = 4
-				l = unpack('!H',data[2:4])[0]	# struct.unpack
-			elif l == 127:
-				b = 10
-				l = unpack('!Q',data[2:10])[0]
-		# Different Opcodes
-		
-			if data[b] == 47:
-				print(data)
-			elif data[b] == 48:
-				self.pingcount += 1
-				self.ProcessPing(data[b:])
-				
-			elif data[b] == 53:
-				self.onPacketReceived(data[b:].decode("utf8"),l-b,t)
-			else:
-				print("unknown opcode",data)
-			reactor.callLater(25,self.Heartbeat)
-		else:
-			print("Unknwon state",self.state)
-	
-	def ProcessPing(self,data):
-		since = 0
-		now = time()
-		if self.lastpingat != 0:
-			since = now-self.lastpingat
-			self.pinginterval = since
-		self.lastpingat = now
-#		print "---> ping",self.pingcount,"%0.2f"%since,"\t",data
-	
-	def lineReceived(self,line):
-		"""Parse the http Packet (linewise) and switch states accordingly"""
-		line = line.decode('utf8')
-		if "HTTP/1.1" in line:	# First line in response
-			lc = line.split(" ")
-			http,code,phrase = lc[0],int(lc[1])," ".join(lc[2:])
-			if code == 200:
-				self.http_pos = "head"
-			elif code == 101:
-				self.state = 1
-			else:
-				self.http_pos = ""
-				self.Terminate([code,phrase])
-		elif self.state == 0:
-			self.eatUpHTTP(line)
-		elif self.state == 1:
-			if "Sec-WebSocket-Accept:" in line:
-				key_got = line.split(" ")[1]
-				mysha1 = sha1()
-				mysha1.update(self.websocket_key.encode('utf8') + self._MAGIC)
-				key_accept = b64encode(mysha1.digest()).decode('utf8')
-				if key_got == key_accept:
-					print("WS 0.9 connection accepted")
-					self.state = 2
-				else:
-					self.Terminate(["key missmatch",key_got,key_accept])
-			elif "Upgrade:" in line:
-				if line.split(" ")[1] != "websocket":
-					self.Terminate(["Upgrade to websocket failed",line])
-		elif self.state == 2:
-			if line == "":		# Wait for the packet to end
-				self.setRawMode()	
-			else:
-				print("Should never happen",len(line),line)
-		else:
-			print("unexpected:",line)
-	# 
-	def Terminate(self,reason):
-	 	print("Terminate",reason)
-		
-	def onPacketReceived(self,data,length,t):
-		""" Dummy, implement Your own websocket-packet-processing"""
-		print("Packet",length,data)
-	
-	def connectionLost(self,reason):
-		print("WSconnectionLost",reason)
-
-		
-class WSjsonBitcoinDEProtocol(ClientIo0916Protocol):
-	""" Processes the Content of the Websocket packet treating it as JSON and pass the dict to an onEvent-function mimmicing the original js behaviour"""
-	def onPacketReceived(self,data,length,t):
-		i = 1
-		while data[i] == ":":
-			i+=1
-		jdata = loads(data[i:])	# json.loads
-		otype,args = jdata["name"],jdata["args"][0]
-		self.factory.onEvent(otype,args,t)
-		
-	def Terminate(self,reason):
-	 	print("WSjson Terminate",reason)
-
-	def connectionLost(self,reason):
-		print("WSjson connectionLost",reason)
-
-# * * * * * * * * * * * socket.io > 2.0 Implementation * * * * * * * * * * * #
-
-class ClientIo2011Protocol(basic.LineReceiver):
-	_MAGIC = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"	# Handshake key signing
-	
-	def connectionMade(self):
-		self.nonce = time()*1000
+		self.nonce = int(time()*1000)
+		self.sid = None
 		self.header = [{"lines":[]}]
 		self.eio = 3
 		
 		self.pingInterval = 20
 		self.pingcount = 0
-		self.nextlen = 0
+		self.ws_packet_count = 0
 		
-		self.setLineMode()
+		self.state = ClientIo24State.init
 		self.sendInit()
 		
+	def GetNonce(self):
+		self.nonce += 1
+		return urlsafe_b64encode(pack('>q',self.nonce)).decode("utf-8")[:-1]
+	
 	def sendInit(self):
-		cookie = self.header[-1].get("cookie","")
-		data = ""
-		if len(cookie) > 0:
-			cookie = "&io="+cookie
-		data = "GET /socket.io/1/?EIO=%d%s&t=%d-0&transport=polling HTTP/1.1\r\n"%(self.eio,cookie,self.nonce)
-		self.sendLine(data.encode('utf8'))	# first GET request
-		
-
+		self.state = ClientIo24State.init
+		self.setLineMode()
+		data = "GET /socket.io/1/?EIO=%d&transport=polling&t=%s HTTP/1.1\r\n"%(self.eio,self.GetNonce())
+		self.sendLine(data.encode('utf8'))	# first GET reques
+	
 	def lineReceived(self,line):
 		if len(line) > 3:
 			self.header[-1]["lines"].append(line)
 		else:
 			self.onHTTPHeader()
-		
+	
+	def ParseSID_Packet(self,line):
+		try:
+			sid = loads("{"+line.split("{")[1].split("}")[0]+"}")
+			self.sid = sid.get("sid",None)
+			self.pingInterval = sid.get("pingInterval",1100*20)/1100			
+		except:
+			sid = {}
+		return sid
+	
 	def onHTTPHeader(self):
 		upgrade = False
 		header = self.header[-1]
@@ -257,28 +107,16 @@ class ClientIo2011Protocol(basic.LineReceiver):
 				words = line.split("HTTP/1.1 ")[1].split(" ")
 				code,word = words[0]," ".join(words[1:])
 				header["code"] = code
-			if "Set-Cookie:" in line:
-				cookie = line.split("=")[1].split(";")[0]
-				header["cookie"] = cookie
-			elif '"upgrades"' in line:
-				upgrade = True
 			elif "Upgrade:" in line:
 				header["Upgrade"] = line.split(": ")[-1]
 			elif "Sec-WebSocket-Accept" in line:
 				header["Key"] = line.split(": ")[-1]
-			
-			if "pingInterval" in line:	# Retrieve pingInterval from Response
-				inter = line.split("pingInterval")
-				if len(inter) > 1:
-					self.pingInterval = int(inter[1].split(":")[1].split(",")[0])/1100
-					
-		if code == "200":
-			if upgrade == False:
+		
+		if code == "101" and header.get("Upgrade",None) == "websocket":
+			if not self.checkWebsocket():
 				self.sendInit()
-			else:
-				self.sendUpgrade()
-		elif code == "101":
-			self.checkWebsocket()
+		elif code == "200":
+			self.setRawMode()	
 		else:
 			print(code,header)
 		
@@ -287,11 +125,14 @@ class ClientIo2011Protocol(basic.LineReceiver):
 	def sendUpgrade(self):
 		key = b64encode(urandom(16))
 		self.websocket_key = key
-		data = "GET /socket.io/1/?EIO=%d&transport=websocket&t=%d-2%s HTTP/1.1\r\n"%(self.eio,time()*1000,self.header[-1].get("cookie",""))
+		
+		data = ""
+		data = "GET /socket.io/1/?EIO=%d&transport=websocket&t=%s&sid=%s HTTP/1.1\r\n"%(self.eio,self.GetNonce(),self.sid)
 		data += "Connection: Upgrade\r\nUpgrade: Websocket\r\n"
+		data += "Cache-Control: no-cache\r\n"
+		data += "Pragma: no-cache\r\nCache-Control: no-cache\r\n"		
 		data += "Sec-WebSocket-Key: %s\r\n"%(self.websocket_key.decode('utf8'))
 		data += "Sec-WebSocket-Version: 13\r\n"
-		data += "Pragma: no-cache\r\nCache-Control: no-cache\r\n"		
 		self.sendLine(data.encode('utf8'))
 		
 	def checkWebsocket(self):
@@ -301,72 +142,107 @@ class ClientIo2011Protocol(basic.LineReceiver):
 		key_accept = b64encode(mysha1.digest()).decode('utf8')
 		if key_got == key_accept:
 			self.setRawMode()
-			reactor.callLater(3,self.sendPing)
-			reactor.callLater(2,self.requestMarket)
-			print("WS 2.0 connection accepted")
+			reactor.callLater(1,self.sendPing,"probe")
+			self.state = ClientIo24State.upgrade
+			print("WS 2.4 connection accepted")
+			return True
+		return False
+			
+	def WebsocketSend(self,data,binary=False,op="text"):
+		l = len(data)
+		
+		fin = 0x80
+		opcode = {"text":1,"binary":2,"ping":3}.get(op,1)
+		is_masked = 0x8000
+		
+		if binary == False:
+			if l > 126:
+				pass
+			else:
+				length = l<<8
+				sdata = pack('H',fin+opcode+is_masked+length)
+			sdata += pack('I',0)
+			sdata += data			
+			self.transport.write(sdata)
+		else:
+			print("binary not yet implemented",data)
 		
 	def rawDataReceived(self,data):
+		t = time()
 		if type(data) == str:
 			data = bytearray(data)
-		
-		t = time()
-		if len(data) > 4:
-#			print self.nextlen,map(ord,data[:8]),data[:20],data[-20:]
-			sd = data.split("42/market,".encode('utf8'))
-			if len(sd) >= 2:
-				# len(data),self.nextlen	# socket.io does wierd things with it's length==4 packets...
-				content = (sd[1]).decode('utf8')
-				self.onPacketReceived(content,len(content),t)
-				
-				self.nextlen = 0
-		elif len(data) == 4:
-			self.nextlen = unpack('!H',data[2:4])[0]
-		elif len(data) == 3:
-			if data[1] == 1 and data[2] == 51:
-				reactor.callLater(self.pingInterval,self.sendPing)
-				self.nextlen = 0
-			else:
-				self.nextlen = 0
-				print("short unknown")
-		else:
-			self.nextlen = 0
-			print("unknwon",data)
 			
+		if self.state == ClientIo24State.init:
+			pdata = self.ParseSID_Packet(data.decode("utf-8"))
+			if self.sid != None:
+				self.state = ClientIo24State.sid
+				self.setLineMode()
+				self.sendUpgrade()
+		else:
+			self.DecodeWebsocket(data)
 	
-	def sendPing(self):
+	def DecodeWebsocket(self,data):
+		self.ws_packet_count += 1
+		l,b = data[1]&(0b1111111),2	# Handle the length field
+		op = data[0] & 0x0f
+		if l == 126:
+			b = 4
+			l = unpack('!H',data[2:4])[0]	# struct.unpack
+		elif l == 127:
+			b = 10
+			l = unpack('!Q',data[2:10])[0]
+		
+		if op == 1:
+			if self.state == ClientIo24State.websocket:
+				if data[b:] == "3".encode("utf-8"):
+					print("pong")
+					reactor.callLater(self.pingInterval,self.sendPing)
+				elif data[b:b+10] == b"42/market,":
+					pass
+				else:
+					print(data[b:])
+#					self.onPacketReceived()
+			elif self.state == ClientIo24State.upgrade:
+				if data[b:] == "3probe".encode("utf-8"):
+					reactor.callLater(1,self.WebsocketSend,"5".encode("utf-8"))
+					reactor.callLater(5,self.sendPing)
+					reactor.callLater(1.5,self.WebsocketSend,"40/market,".encode("utf-8"))
+					self.state = ClientIo24State.websocket
+				else:
+					print("wrong probe response",data[b:])
+								
+		else:
+			print("other op",op)	
+
+	def sendPing(self,text=""):
 		self.pingcount += 1
-#		print "Send Ping"
-		ping = bytearray([129,1])+bytes("2".encode('utf8'))
-		self.transport.write(bytes(ping))
-	
-	def requestMarket(self):
-		sd = b"40/market,"
-#		print "Send RequestMarket"
-		sp = bytearray([129,len(sd)])+bytes(sd)
-		self.transport.write(bytes(sp))
+		self.WebsocketSend(("2"+text).encode("utf-8"))
 		
 	def Terminate(self,reason):
 	 	print("Terminate",reason)
 		
 	def onPacketReceived(self,data,length,t):
 		""" Dummy, implement Your own websocket-packet-processing"""
-		print("Packet",length,data)
+		print("Packet",length,data,t)
 	
 	def connectionLost(self,reason):
 		print("WSconnectionLost",reason)
-	
-class WSjsonBitcoinDEProtocol2(ClientIo2011Protocol):
+
+class WSjsonBitcoinDEProtocol24(ClientIo24Protocol):
 	""" Processes the Content of the Websocket packet treating it as JSON and pass the dict to an onEvent-function mimmicing the original js behaviour"""
 	def onPacketReceived(self,data,length,t):
-		di = data.index(',')
-		evt,args = data[2:di-1],loads(data[di+1:-1])
-		self.factory.onEvent(evt,args,t)
+		
+		pass # TODO
+#		di = data.index(',')
+#		evt,args = data[2:di-1],loads(data[di+1:-1])
+#		self.factory.onEvent(evt,args,t)
 		
 	def Terminate(self,reason):
 	 	print("WSjson Terminate",reason)
 
 	def connectionLost(self,reason):
 		print("WSjson connectionLost",reason)
+
 
 # * * * * * * * * * * * MultiSource Factories * * * * * * * * * * * #
 
@@ -382,9 +258,9 @@ class MultiSource(Factory):
 	def onEvent(self,evt,data,t):
 		self.receiver.ReceiveEvent(evt,data,self.sid,t)
 
-class BitcoinWSSourceV09(MultiSource):
-	protocol = WSjsonBitcoinDEProtocol
-	WSversion = "09"
+class BitcoinWSSourceV24(MultiSource):
+	protocol = WSjsonBitcoinDEProtocol24
+	WSversion = "24"
 	
 	def __str__(self):
 		return "WSSource%d %s"%(self.sid,self.WSversion)
@@ -401,9 +277,6 @@ class BitcoinWSSourceV09(MultiSource):
 	def connectionLost(self,connector,reason):
 		print("\t%s connectionList"%self,connector,reason)
 	
-class BitcoinWSSourceV20(BitcoinWSSourceV09):
-	protocol = WSjsonBitcoinDEProtocol2
-	WSversion = "20"
 
 # * * * * * * * * * * MultiSource Implementation * * * * * * * * * * #
 
@@ -594,8 +467,8 @@ class bitcoinWSrpo(bitcoinWSeventstream):
 
 class BitcoinWSmulti(object):
 	"""ClientService ensures restart after connection is lost."""
-	def __init__(self,servers=[1,2,3,4]):
-		self.servers = {1:("ws",BitcoinWSSourceV09,),2:("ws1",BitcoinWSSourceV09,),3:("ws2",BitcoinWSSourceV20,),4:("ws3",BitcoinWSSourceV20,)}
+	def __init__(self,servers=[1]):
+		self.servers = {1:("ws",BitcoinWSSourceV24,),2:("ws1",BitcoinWSSourceV24,),3:("ws2",BitcoinWSSourceV24,),4:("ws3",BitcoinWSSourceV24,)}
 	#	self.servers = {1:("ws1",BitcoinWSSourceV09,)}
 	#	self.servers = {3:["ws2",BitcoinWSSourceV20,]}
 		self.sources = {}
